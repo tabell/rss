@@ -9,9 +9,11 @@ package main
 // Right pane is a preview of "selected" article (selected article automatically cycles through every 10s)
 
 import (
+	"bufio"
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -26,8 +28,8 @@ type Article struct {
 	Fetched     time.Time `json:"fetched"`
 }
 
-// RSSFeed struct
-type RSSFeed struct {
+// Feed struct
+type Feed struct {
 	ID              int       `json:"id"`
 	URL             string    `json:"url"`
 	LastCheckedTime time.Time `json:"last_checked_time"`
@@ -37,7 +39,7 @@ type RSSFeed struct {
 func CreateFeedsTable(db *sql.DB) {
 	sql_table := `
 	CREATE TABLE IF NOT EXISTS Feeds(
-		ID INTEGER PRIMARY KEY,
+		ID INTEGER PRIMARY KEY AUTOINCREMENT,
 		URL TEXT NOT NULL UNIQUE,
 		LastCheckedTime TIMESTAMP);
 	`
@@ -48,22 +50,65 @@ func CreateFeedsTable(db *sql.DB) {
 	}
 }
 
-// Function to store a RSSFeed
-func StoreFeed(db *sql.DB, feed RSSFeed) error {
+// Load a feed
+func LoadFeeds(db *sql.DB) ([]Feed, error) {
+	var feeds []Feed
+	rows, err := db.Query("SELECT * FROM Feeds;")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var feed Feed
+		if err := rows.Scan(&feed.ID, &feed.URL, &feed.LastCheckedTime); err != nil {
+			return nil, fmt.Errorf("LoadFeeds %v", err)
+		}
+		feeds = append(feeds, feed)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("LoadFeeds %v", err)
+	}
+	return feeds, nil
+}
+
+// Function to store a Feed
+func StoreFeed(db *sql.DB, feed Feed) error {
 	sql_addfeed := `
-	INSERT OR REPLACE INTO Feeds(
+	INSERT INTO Feeds(
+		URL,
+		LastCheckedTime)
+	VALUES(?, ?);
+	`
+	sql_updatefeed := `
+	REPLACE INTO Feeds(
 		ID,
 		URL,
 		LastCheckedTime)
 	VALUES(?, ?, ?);
 	`
-	stmt, err := db.Prepare(sql_addfeed)
+
+	var creating bool
+	var sql string
+	if feed.ID == 0 {
+		creating = true
+		sql = sql_addfeed
+	} else {
+		creating = false
+		sql = sql_updatefeed
+	}
+
+	stmt, err := db.Prepare(sql)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
-	_, err = stmt.Exec(feed.ID, feed.URL, feed.LastCheckedTime)
+	if creating == true {
+		_, err = stmt.Exec(feed.URL, feed.LastCheckedTime)
+	} else {
+		_, err = stmt.Exec(feed.ID, feed.URL, feed.LastCheckedTime)
+	}
 	if err != nil {
 		return err
 	}
@@ -130,8 +175,8 @@ func StoreArticle(db *sql.DB, article Article, FeedID int) error {
 	return nil
 }
 
-// Function to update the LastCheckedTime of a RSSFeed
-func UpdateFeedLastCheckedTime(db *sql.DB, feed *RSSFeed) error {
+// Function to update the LastCheckedTime of a Feed
+func UpdateFeedLastCheckedTime(db *sql.DB, feed *Feed) error {
 	sql_update := `
 	UPDATE Feeds
 	SET LastCheckedTime = ?
@@ -151,7 +196,29 @@ func UpdateFeedLastCheckedTime(db *sql.DB, feed *RSSFeed) error {
 	return nil
 }
 
-func CheckNewArticles(db *sql.DB, feed *RSSFeed) ([]Article, error) {
+func attemptTimeParse(formats []string, input string) (time.Time, error) {
+	var parsedTime time.Time
+	var err error
+
+	for _, format := range formats {
+		parsedTime, err = time.Parse(format, input)
+		if err == nil {
+			// Parsing succeeded, return the parsed time
+			return parsedTime, nil
+		}
+	}
+
+	// If no format successfully parses the input, return an error
+	return time.Time{}, fmt.Errorf("failed to parse input '%s'", input)
+}
+
+func CheckNewArticles(db *sql.DB, feed *Feed) ([]Article, error) {
+	dateFormats := []string{
+		time.RFC1123,
+		time.RFC1123Z,
+		time.RFC3339,
+	}
+	log.Printf("Last check time: %v", feed.LastCheckedTime)
 	checkTime := time.Now()
 	fp := gofeed.NewParser()
 	rss, err := fp.ParseURL(feed.URL)
@@ -161,11 +228,14 @@ func CheckNewArticles(db *sql.DB, feed *RSSFeed) ([]Article, error) {
 
 	var articles []Article
 	for _, item := range rss.Items {
-		pubDate, err := time.Parse("Mon, 02 Jan 2006 15:04:05 MST", item.Published)
+		pubDate, err := attemptTimeParse(dateFormats, item.Published)
 		if err != nil {
-			continue
+			log.Printf("%+v", item)
+			log.Fatalf("Error parsing date: %v", err)
 		}
+		//if pubDate.After(feed.LastCheckedTime.Add(-time.Hour * 24)) {
 		if pubDate.After(feed.LastCheckedTime) {
+			log.Printf("New article found: feedID=%d pubDate=%v title=%s", feed.ID, pubDate, item.Title)
 			articles = append(articles, Article{
 				Title:       item.Title,
 				Link:        item.Link,
@@ -180,37 +250,67 @@ func CheckNewArticles(db *sql.DB, feed *RSSFeed) ([]Article, error) {
 	return articles, nil
 }
 
+func CreateFeeds(path string, db *sql.DB) error {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		url := scanner.Text()
+		log.Printf("Creating new feed from %s", url)
+		feed := &Feed{
+			URL:             url,
+			LastCheckedTime: time.Time{}, // initialize to zero value
+		}
+
+		err := StoreFeed(db, *feed)
+		if err != nil {
+			log.Printf("WARN: Failed to initialize feed (%s): %v", url, err)
+		}
+	}
+	return nil
+}
+
 func main() {
 
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	db := InitDB("rss.db")
+	//err := CreateFeeds("urls2", db)
+	//if err != nil {
+	//	log.Fatalf("Error creating feeds into db: %v", err)
+	//}
+
 	log.Printf("Database ready")
-	// Create a RSSFeed
-	// feed := &RSSFeed{
-	// 	URL:             "https://therecord.media/feed/",
-	// 	LastCheckedTime: time.Now().Add(-24 * time.Hour), // Last checked 24 hours ago
-	// }
 
-	err := StoreFeed(db, *feed)
+	feeds, err := LoadFeeds(db)
 	if err != nil {
-		log.Fatalf("Failed to store feed: %v", err)
+		log.Fatalf("Error loading feeds from db: %v", err)
 	}
 
-	// Check for new articles and return a list of articles plus update the db
-	newArticles, err := CheckNewArticles(db, feed)
-	if err != nil {
-		log.Fatalf("Error checking new articles: %v", err)
-	}
-
-	// Iterate over the articles and print them
-	for _, article := range newArticles {
-		err = StoreArticle(db, article, feed.ID)
+	for i, f := range feeds {
+		log.Printf("feed %d: %v\n", i, f)
+		// Check for new articles and return a list of articles plus update the db
+		newArticles, err := CheckNewArticles(db, &f)
 		if err != nil {
-			log.Fatalf("Failed to store article: %v", err)
+			log.Fatalf("Error checking new articles: %v", err)
 		}
-		fmt.Printf("Title: %s\n", article.Title)
-		fmt.Printf("Link: %s\n", article.Link)
-		//		fmt.Printf("Description: %s\n", article.Description)
-		fmt.Printf("Published: %s\n", article.Published)
-		fmt.Println()
+
+		// Iterate over the articles and print them
+		for _, article := range newArticles {
+			err = StoreArticle(db, article, f.ID)
+			if err != nil {
+				log.Fatalf("Failed to store article: %v", err)
+			}
+			fmt.Printf("Title: %s\n", article.Title)
+			fmt.Printf("Link: %s\n", article.Link)
+			//		fmt.Printf("Description: %s\n", article.Description)
+			fmt.Printf("Published: %s\n", article.Published)
+			fmt.Println()
+		}
 	}
+
 }
