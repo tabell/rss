@@ -8,9 +8,12 @@ package main
 // Then add graphics. Split into two panes vertically. Left pane is a list of articles
 // Right pane is a preview of "selected" article (selected article automatically cycles through every 10s)
 
+// Currently running the main function will read existing feeds out of the database, download all new articles and store them back to db
+// Does not currently check for dupes
 import (
 	"bufio"
 	"database/sql"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -21,11 +24,13 @@ import (
 )
 
 type Article struct {
+	Unread      bool      `json:"unread"`
 	Title       string    `json:"title"`
 	Link        string    `json:"link"`
 	Description string    `json:"description"`
 	Published   time.Time `json:"published"`
 	Fetched     time.Time `json:"fetched"`
+	FeedID      int       `json:"feed"`
 }
 
 // Feed struct
@@ -48,6 +53,28 @@ func CreateFeedsTable(db *sql.DB) {
 	if err != nil {
 		log.Fatalf("Failed to create Feeds table: %v", err)
 	}
+}
+
+func LoadUnreadArticles(db *sql.DB) ([]Article, error) {
+	var articles []Article
+	rows, err := db.Query("SELECT * FROM Articles WHERE Unread==1;")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var a Article
+		if err := rows.Scan(&a.FeedID, &a.Unread, &a.Title, &a.Link, &a.Description, &a.Published, &a.Fetched); err != nil {
+			return nil, fmt.Errorf("%v", err)
+		}
+		articles = append(articles, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%v", err)
+	}
+	return articles, nil
+
 }
 
 // Load a feed
@@ -136,6 +163,7 @@ func CreateArticleTable(db *sql.DB) {
 	sql_table := `
 	CREATE TABLE IF NOT EXISTS Articles(
         FeedID INTEGER,
+		Unread BOOLEAN,
 		Title TEXT,
 		Link TEXT,
 		Description TEXT,
@@ -154,12 +182,13 @@ func StoreArticle(db *sql.DB, article Article, FeedID int) error {
 	sql_additem := `
 	INSERT INTO Articles(
         FeedID,
+		Unread,
 		Title,
 		Link,
 		Description,
 		Published,
 		Fetched)
-	VALUES(?, ?, ?, ?, ?, ?);
+	VALUES(?, ?, ?, ?, ?, ?, ?);
 	`
 	stmt, err := db.Prepare(sql_additem)
 	if err != nil {
@@ -167,7 +196,7 @@ func StoreArticle(db *sql.DB, article Article, FeedID int) error {
 	}
 	defer stmt.Close()
 
-	_, err = stmt.Exec(FeedID, article.Title, article.Link, article.Description, article.Published, article.Fetched)
+	_, err = stmt.Exec(FeedID, article.Unread, article.Title, article.Link, article.Description, article.Published, article.Fetched)
 	if err != nil {
 		return err
 	}
@@ -238,6 +267,7 @@ func CheckNewArticles(db *sql.DB, feed *Feed) ([]Article, error) {
 			log.Printf("New article found: feedID=%d pubDate=%v title=%s", feed.ID, pubDate, item.Title)
 			articles = append(articles, Article{
 				Title:       item.Title,
+				Unread:      true,
 				Link:        item.Link,
 				Description: item.Description,
 				Published:   pubDate,
@@ -274,43 +304,106 @@ func CreateFeeds(path string, db *sql.DB) error {
 	return nil
 }
 
-func main() {
+var (
+	_verbose = flag.Bool("verbose", false, "print lots of extra info")
+)
 
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+func markAllRead(db *sql.DB) error {
+	_, err := db.Query("UPDATE Articles SET Unread=0;")
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
-	db := InitDB("rss.db")
-	//err := CreateFeeds("urls2", db)
-	//if err != nil {
-	//	log.Fatalf("Error creating feeds into db: %v", err)
-	//}
+func printUnread(db *sql.DB) error {
+	articles, err := LoadUnreadArticles(db)
+	if err != nil {
+		return fmt.Errorf("Error loading articles from db: %+v", err)
+	}
 
-	log.Printf("Database ready")
-
+	for _, a := range articles {
+		fmt.Printf("Title: %s\n", a.Title)
+		fmt.Printf("Link: %s\n", a.Link)
+		//		fmt.Printf("Description: %s\n", article.Description)
+		fmt.Printf("Published: %s\n", a.Published)
+		fmt.Println()
+	}
+	return nil
+}
+func updateFeeds(db *sql.DB) error {
 	feeds, err := LoadFeeds(db)
 	if err != nil {
-		log.Fatalf("Error loading feeds from db: %v", err)
+		return fmt.Errorf("Error loading feeds from db: %v", err)
 	}
+
+	log.Printf("Updating %d feeds", len(feeds))
 
 	for i, f := range feeds {
 		log.Printf("feed %d: %v\n", i, f)
 		// Check for new articles and return a list of articles plus update the db
 		newArticles, err := CheckNewArticles(db, &f)
 		if err != nil {
-			log.Fatalf("Error checking new articles: %v", err)
+			log.Printf("Error checking new articles: %v", err)
+			continue
 		}
+
+		log.Printf("Retrieved %d articles", len(newArticles))
 
 		// Iterate over the articles and print them
 		for _, article := range newArticles {
 			err = StoreArticle(db, article, f.ID)
 			if err != nil {
-				log.Fatalf("Failed to store article: %v", err)
+				return fmt.Errorf("Failed to store article: %v", err)
 			}
-			fmt.Printf("Title: %s\n", article.Title)
-			fmt.Printf("Link: %s\n", article.Link)
-			//		fmt.Printf("Description: %s\n", article.Description)
-			fmt.Printf("Published: %s\n", article.Published)
-			fmt.Println()
 		}
+	}
+	return nil
+}
+
+func main() {
+
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	// Parse global flags
+	flag.Parse()
+
+	db := InitDB("rss.db")
+	defer db.Close()
+	log.Printf("Database ready")
+
+	// Parse subcommand
+	args := flag.Args()
+	if len(args) == 0 {
+		log.Fatal("Please specify a subcommand.")
+	}
+	cmd, args := args[0], args[1:]
+
+	switch cmd {
+	case "update":
+		updateFeeds(db)
+	case "unread":
+		err := printUnread(db)
+		if err != nil {
+			log.Fatalf("Error reading unread article: %v", err)
+		}
+		markAllRead(db)
+		if err != nil {
+			log.Fatalf("Error setting unread flag: %v", err)
+		}
+
+	case "add":
+		if len(args) > 0 {
+			err := CreateFeeds(args[0], db)
+			if err != nil {
+				log.Fatalf("Error adding feeds to db: %v", err)
+			}
+		} else {
+			log.Fatalf("Usage: add <filename>")
+		}
+	default:
+		log.Fatalf("Unrecognized command %q. "+
+			"Command must be one of: update, unread", cmd)
 	}
 
 }
