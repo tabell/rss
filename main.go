@@ -24,7 +24,7 @@ import (
 )
 
 type Article struct {
-	Unread      bool      `json:"unread"`
+	Read        bool      `json:"read"`
 	Title       string    `json:"title"`
 	Link        string    `json:"link"`
 	Description string    `json:"description"`
@@ -55,9 +55,16 @@ func CreateFeedsTable(db *sql.DB) {
 	}
 }
 
-func LoadUnreadArticles(db *sql.DB) ([]Article, error) {
+func LoadArticles(db *sql.DB, includeRead bool, maxArticles int) ([]Article, error) {
 	var articles []Article
-	rows, err := db.Query("SELECT * FROM Articles WHERE Unread==1;")
+	var query string
+	if includeRead {
+		query = "SELECT * FROM Articles LIMIT ?;"
+	} else {
+		query = "SELECT * FROM Articles WHERE Read==0 LIMIT ?;"
+	}
+
+	rows, err := db.Query(query, maxArticles)
 	if err != nil {
 		return nil, err
 	}
@@ -65,16 +72,15 @@ func LoadUnreadArticles(db *sql.DB) ([]Article, error) {
 
 	for rows.Next() {
 		var a Article
-		if err := rows.Scan(&a.FeedID, &a.Unread, &a.Title, &a.Link, &a.Description, &a.Published, &a.Fetched); err != nil {
-			return nil, fmt.Errorf("%v", err)
+		if err := rows.Scan(&a.FeedID, &a.Read, &a.Title, &a.Link, &a.Description, &a.Published, &a.Fetched); err != nil {
+			return nil, fmt.Errorf("Error parsing row: %v", err)
 		}
 		articles = append(articles, a)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("%v", err)
+		return nil, err
 	}
 	return articles, nil
-
 }
 
 // Load a feed
@@ -163,7 +169,7 @@ func CreateArticleTable(db *sql.DB) {
 	sql_table := `
 	CREATE TABLE IF NOT EXISTS Articles(
         FeedID INTEGER,
-		Unread BOOLEAN,
+		Read BOOLEAN,
 		Title TEXT,
 		Link TEXT,
 		Description TEXT,
@@ -182,7 +188,7 @@ func StoreArticle(db *sql.DB, article Article, FeedID int) error {
 	sql_additem := `
 	INSERT INTO Articles(
         FeedID,
-		Unread,
+		Read,
 		Title,
 		Link,
 		Description,
@@ -196,7 +202,7 @@ func StoreArticle(db *sql.DB, article Article, FeedID int) error {
 	}
 	defer stmt.Close()
 
-	_, err = stmt.Exec(FeedID, article.Unread, article.Title, article.Link, article.Description, article.Published, article.Fetched)
+	_, err = stmt.Exec(FeedID, article.Read, article.Title, article.Link, article.Description, article.Published, article.Fetched)
 	if err != nil {
 		return err
 	}
@@ -247,7 +253,8 @@ func CheckNewArticles(db *sql.DB, feed *Feed) ([]Article, error) {
 		time.RFC1123Z,
 		time.RFC3339,
 	}
-	log.Printf("Last check time: %v", feed.LastCheckedTime)
+
+	//log.Printf("Last check time: %v", feed.LastCheckedTime)
 	checkTime := time.Now()
 	fp := gofeed.NewParser()
 	rss, err := fp.ParseURL(feed.URL)
@@ -259,15 +266,13 @@ func CheckNewArticles(db *sql.DB, feed *Feed) ([]Article, error) {
 	for _, item := range rss.Items {
 		pubDate, err := attemptTimeParse(dateFormats, item.Published)
 		if err != nil {
-			log.Printf("%+v", item)
-			log.Fatalf("Error parsing date: %v", err)
+			log.Fatalf("Error parsing date (%v): %v", item.Published, err)
 		}
-		//if pubDate.After(feed.LastCheckedTime.Add(-time.Hour * 24)) {
 		if pubDate.After(feed.LastCheckedTime) {
-			log.Printf("New article found: feedID=%d pubDate=%v title=%s", feed.ID, pubDate, item.Title)
+			//	log.Printf("New article found: feedID=%d pubDate=%v title=%s", feed.ID, pubDate, item.Title)
 			articles = append(articles, Article{
 				Title:       item.Title,
-				Unread:      true,
+				Read:        false,
 				Link:        item.Link,
 				Description: item.Description,
 				Published:   pubDate,
@@ -290,7 +295,7 @@ func CreateFeeds(path string, db *sql.DB) error {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		url := scanner.Text()
-		log.Printf("Creating new feed from %s", url)
+		//log.Printf("Creating new feed from %s", url)
 		feed := &Feed{
 			URL:             url,
 			LastCheckedTime: time.Time{}, // initialize to zero value
@@ -309,18 +314,20 @@ var (
 )
 
 func markAllRead(db *sql.DB) error {
-	_, err := db.Query("UPDATE Articles SET Unread=0;")
+	_, err := db.Query("UPDATE Articles SET Read=1;")
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func printUnread(db *sql.DB) error {
-	articles, err := LoadUnreadArticles(db)
+func printArticles(db *sql.DB, printRead bool) error {
+	articles, err := LoadArticles(db, printRead, 500)
 	if err != nil {
-		return fmt.Errorf("Error loading articles from db: %+v", err)
+		log.Printf("Error loading articles from db: %+v", err)
+		return err
 	}
+	log.Printf("Loaded %d articles", len(articles))
 
 	for _, a := range articles {
 		fmt.Printf("Title: %s\n", a.Title)
@@ -370,7 +377,7 @@ func main() {
 
 	db := InitDB("rss.db")
 	defer db.Close()
-	log.Printf("Database ready")
+	//log.Printf("Database ready")
 
 	// Parse subcommand
 	args := flag.Args()
@@ -383,7 +390,7 @@ func main() {
 	case "update":
 		updateFeeds(db)
 	case "unread":
-		err := printUnread(db)
+		err := printArticles(db, false)
 		if err != nil {
 			log.Fatalf("Error reading unread article: %v", err)
 		}
