@@ -13,17 +13,21 @@ package main
 import (
 	"bufio"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
+	"github.com/blevesearch/bleve"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mmcdole/gofeed"
 )
 
 type Article struct {
+	ID          int       `json:"id"`
 	Read        bool      `json:"read"`
 	Title       string    `json:"title"`
 	Link        string    `json:"link"`
@@ -55,6 +59,25 @@ func CreateFeedsTable(db *sql.DB) {
 	}
 }
 
+func LoadArticle(db *sql.DB, ID int) (*Article, error) {
+	query := "SELECT * FROM Articles WHERE ID == ? LIMIT 1;"
+	rows, err := db.Query(query, ID)
+	if err != nil {
+		return nil, fmt.Errorf("db query error: %w")
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var a Article
+		if err := rows.Scan(&a.ID, &a.FeedID, &a.Read, &a.Title, &a.Link, &a.Description, &a.Published, &a.Fetched); err != nil {
+			return nil, fmt.Errorf("Error parsing row: %w", err)
+		}
+		return &a, nil
+	}
+
+	return nil, errors.New("no matching article found")
+}
+
 func LoadArticles(db *sql.DB, includeRead bool, maxArticles int) ([]Article, error) {
 	var articles []Article
 	var query string
@@ -72,7 +95,7 @@ func LoadArticles(db *sql.DB, includeRead bool, maxArticles int) ([]Article, err
 
 	for rows.Next() {
 		var a Article
-		if err := rows.Scan(&a.FeedID, &a.Read, &a.Title, &a.Link, &a.Description, &a.Published, &a.Fetched); err != nil {
+		if err := rows.Scan(&a.ID, &a.FeedID, &a.Read, &a.Title, &a.Link, &a.Description, &a.Published, &a.Fetched); err != nil {
 			return nil, fmt.Errorf("Error parsing row: %v", err)
 		}
 		articles = append(articles, a)
@@ -168,6 +191,7 @@ func CreateArticleTable(db *sql.DB) {
 	// Create table if it doesn't exist
 	sql_table := `
 	CREATE TABLE IF NOT EXISTS Articles(
+		ID INTEGER PRIMARY KEY AUTOINCREMENT,
         FeedID INTEGER,
 		Read BOOLEAN,
 		Title TEXT,
@@ -266,7 +290,8 @@ func CheckNewArticles(db *sql.DB, feed *Feed) ([]Article, error) {
 	for _, item := range rss.Items {
 		pubDate, err := attemptTimeParse(dateFormats, item.Published)
 		if err != nil {
-			log.Fatalf("Error parsing date (%v): %v", item.Published, err)
+			log.Printf("Error parsing date (%v): %v", item.Published, err)
+			continue
 		}
 		if pubDate.After(feed.LastCheckedTime) {
 			//	log.Printf("New article found: feedID=%d pubDate=%v title=%s", feed.ID, pubDate, item.Title)
@@ -321,6 +346,19 @@ func markAllRead(db *sql.DB) error {
 	return nil
 }
 
+func indexArticles(db *sql.DB, index bleve.Index) error {
+	articles, err := LoadArticles(db, true, 500)
+	if err != nil {
+		return fmt.Errorf("db loading error: %v", err)
+	}
+	log.Printf("Loaded %d articles from db", len(articles))
+
+	for _, a := range articles {
+		index.Index(fmt.Sprintf("%d", a.ID), a) // TODO: is there no way to make the key an int?
+	}
+	return nil
+}
+
 func printArticles(db *sql.DB, printRead bool) error {
 	articles, err := LoadArticles(db, printRead, 500)
 	if err != nil {
@@ -338,7 +376,21 @@ func printArticles(db *sql.DB, printRead bool) error {
 	}
 	return nil
 }
-func updateFeeds(db *sql.DB) error {
+
+func pruneFeeds(db *sql.DB) error {
+	query := "DELETE FROM Feeds WHERE ID NOT IN ( SELECT FeedID FROM Articles WHERE FeedID IS NOT NULL);"
+	result, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("pruning empty feeds: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err == nil {
+		log.Printf("%d feeds pruned", rows)
+	}
+	return nil
+}
+
+func updateFeeds(db *sql.DB, index bleve.Index) error {
 	feeds, err := LoadFeeds(db)
 	if err != nil {
 		return fmt.Errorf("Error loading feeds from db: %v", err)
@@ -346,10 +398,10 @@ func updateFeeds(db *sql.DB) error {
 
 	log.Printf("Updating %d feeds", len(feeds))
 
-	for i, f := range feeds {
-		log.Printf("feed %d: %v\n", i, f)
+	for i, feed := range feeds {
+		log.Printf("feed %d: %v\n", i, feed)
 		// Check for new articles and return a list of articles plus update the db
-		newArticles, err := CheckNewArticles(db, &f)
+		newArticles, err := CheckNewArticles(db, &feed)
 		if err != nil {
 			log.Printf("Error checking new articles: %v", err)
 			continue
@@ -359,10 +411,11 @@ func updateFeeds(db *sql.DB) error {
 
 		// Iterate over the articles and print them
 		for _, article := range newArticles {
-			err = StoreArticle(db, article, f.ID)
+			err = StoreArticle(db, article, feed.ID)
 			if err != nil {
 				return fmt.Errorf("Failed to store article: %v", err)
 			}
+			index.Index(string(article.ID), article)
 		}
 	}
 	return nil
@@ -379,6 +432,20 @@ func main() {
 	defer db.Close()
 	//log.Printf("Database ready")
 
+	var err error
+	var index bleve.Index
+
+	index, err = bleve.Open("_bleve")
+	if err == bleve.ErrorIndexPathDoesNotExist {
+		mapping := bleve.NewIndexMapping()
+		index, err = bleve.New("_bleve", mapping)
+		if err != nil {
+			log.Fatalf("index creation error: %v", err)
+		}
+	} else if err != nil {
+		log.Fatalf("index open error: %v", err)
+	}
+
 	// Parse subcommand
 	args := flag.Args()
 	if len(args) == 0 {
@@ -387,8 +454,37 @@ func main() {
 	cmd, args := args[0], args[1:]
 
 	switch cmd {
+	case "search":
+		if len(args) > 0 {
+			query := bleve.NewQueryStringQuery(args[0])
+			searchRequest := bleve.NewSearchRequest(query)
+			searchResults, _ := index.Search(searchRequest)
+			for _, hit := range searchResults.Hits {
+				id, err := strconv.Atoi(hit.ID)
+				if err == nil {
+					article, err := LoadArticle(db, id)
+					if err != nil {
+						log.Printf("error converting search result %s: %w", id, err)
+						break
+					} else {
+						log.Printf("%+v\n", article)
+					}
+
+				}
+			}
+		} else {
+			log.Fatalf("Usage: search <search string>")
+		}
+
+	case "index":
+		indexArticles(db, index)
 	case "update":
-		updateFeeds(db)
+		updateFeeds(db, index)
+	case "prune":
+		err := pruneFeeds(db)
+		if err != nil {
+			log.Fatalf("error: %w", err)
+		}
 	case "unread":
 		err := printArticles(db, false)
 		if err != nil {
@@ -399,7 +495,7 @@ func main() {
 			log.Fatalf("Error setting unread flag: %v", err)
 		}
 
-	case "add":
+	case "import":
 		if len(args) > 0 {
 			err := CreateFeeds(args[0], db)
 			if err != nil {
