@@ -1,15 +1,5 @@
 package main
 
-// Downloads articles and stores Feed + articles in DB
-
-// Next goal is to make it only add articles if new. On opening app, should check the db and repopulate data structures
-// Then support multiple feeds, and a way to sort all articles
-// by date, and display the top N articles
-// Then add graphics. Split into two panes vertically. Left pane is a list of articles
-// Right pane is a preview of "selected" article (selected article automatically cycles through every 10s)
-
-// Currently running the main function will read existing feeds out of the database, download all new articles and store them back to db
-// Does not currently check for dupes
 import (
 	"bufio"
 	"database/sql"
@@ -35,6 +25,10 @@ type Article struct {
 	Published   time.Time `json:"published"`
 	Fetched     time.Time `json:"fetched"`
 	FeedID      int       `json:"feed"`
+}
+
+func (a *Article) String() string {
+	return fmt.Sprintf("%v: %s", a.Published, a.Title)
 }
 
 // Feed struct
@@ -268,14 +262,15 @@ func attemptTimeParse(formats []string, input string) (time.Time, error) {
 	}
 
 	// If no format successfully parses the input, return an error
-	return time.Time{}, fmt.Errorf("failed to parse input '%s'", input)
+	return time.Time{}, fmt.Errorf("failed to parse date/time : %w", err)
 }
 
 func CheckNewArticles(db *sql.DB, feed *Feed) ([]Article, error) {
 	dateFormats := []string{
 		time.RFC1123,
-		time.RFC1123Z,
 		time.RFC3339,
+		time.RFC1123Z,
+		"Mon, 2 Jan 2006 15:04:05 -0700", // RFC1123 with numeric zone and no leading zero on day
 	}
 
 	//log.Printf("Last check time: %v", feed.LastCheckedTime)
@@ -290,7 +285,7 @@ func CheckNewArticles(db *sql.DB, feed *Feed) ([]Article, error) {
 	for _, item := range rss.Items {
 		pubDate, err := attemptTimeParse(dateFormats, item.Published)
 		if err != nil {
-			log.Printf("Error parsing date (%v): %v", item.Published, err)
+			log.Printf("Error parsing date (%v): %s", item.Published, err)
 			continue
 		}
 		if pubDate.After(feed.LastCheckedTime) {
@@ -368,10 +363,11 @@ func printArticles(db *sql.DB, printRead bool) error {
 	log.Printf("Loaded %d articles", len(articles))
 
 	for _, a := range articles {
-		fmt.Printf("Title: %s\n", a.Title)
-		fmt.Printf("Link: %s\n", a.Link)
-		//		fmt.Printf("Description: %s\n", article.Description)
-		fmt.Printf("Published: %s\n", a.Published)
+		log.Printf("%+v", a)
+		//fmt.Printf("Title: %s\n", a.Title)
+		//fmt.Printf("Link: %s\n", a.Link)
+		////		fmt.Printf("Description: %s\n", article.Description)
+		//fmt.Printf("Published: %s\n", a.Published)
 		fmt.Println()
 	}
 	return nil
@@ -391,6 +387,7 @@ func pruneFeeds(db *sql.DB) error {
 }
 
 func updateFeeds(db *sql.DB, index bleve.Index) error {
+	newCount := 0
 	feeds, err := LoadFeeds(db)
 	if err != nil {
 		return fmt.Errorf("Error loading feeds from db: %v", err)
@@ -399,7 +396,6 @@ func updateFeeds(db *sql.DB, index bleve.Index) error {
 	log.Printf("Updating %d feeds", len(feeds))
 
 	for i, feed := range feeds {
-		log.Printf("feed %d: %v\n", i, feed)
 		// Check for new articles and return a list of articles plus update the db
 		newArticles, err := CheckNewArticles(db, &feed)
 		if err != nil {
@@ -407,17 +403,22 @@ func updateFeeds(db *sql.DB, index bleve.Index) error {
 			continue
 		}
 
-		log.Printf("Retrieved %d articles", len(newArticles))
+		if len(newArticles) > 0 {
+			log.Printf("Retrieved %d articles from %v", len(newArticles), feed.URL)
+			log.Printf("feed %d: %v\n", i, feed)
 
-		// Iterate over the articles and print them
-		for _, article := range newArticles {
-			err = StoreArticle(db, article, feed.ID)
-			if err != nil {
-				return fmt.Errorf("Failed to store article: %v", err)
+			// Iterate over the articles and print them
+			for _, article := range newArticles {
+				err = StoreArticle(db, article, feed.ID)
+				if err != nil {
+					return fmt.Errorf("Failed to store article: %v", err)
+				}
+				index.Index(string(article.ID), article)
+				newCount = newCount + 1
 			}
-			index.Index(string(article.ID), article)
 		}
 	}
+	log.Printf("Fetched %d new articles", newCount)
 	return nil
 }
 
@@ -467,7 +468,7 @@ func main() {
 						log.Printf("error converting search result %s: %w", id, err)
 						break
 					} else {
-						log.Printf("%+v\n", article)
+						log.Printf("score=%.3v, %s, %s\n", hit.Score, article.Published, article.Title)
 					}
 
 				}
