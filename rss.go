@@ -7,17 +7,17 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/blevesearch/bleve"
 	"github.com/mmcdole/gofeed"
-    "gorm.io/gorm"
-    "gorm.io/driver/sqlite"
-
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 type Article struct {
-    gorm.Model
+	gorm.Model
 	Read        bool      `json:"read"`
 	Title       string    `json:"title"`
 	Link        string    `json:"link"`
@@ -25,7 +25,7 @@ type Article struct {
 	Published   time.Time `json:"published"`
 	Fetched     time.Time `json:"fetched"`
 	FeedID      int       `json:"feed"`
-    Feed        Feed
+	Feed        Feed
 }
 
 func (a *Article) String() string {
@@ -34,23 +34,23 @@ func (a *Article) String() string {
 
 // Feed struct
 type Feed struct {
-    gorm.Model
+	gorm.Model
 	URL             string    `json:"url"`
 	LastCheckedTime time.Time `json:"last_checked_time"`
 }
 
 func LoadArticle(db *gorm.DB, ID int) (a *Article, err error) {
-    db.First(&a, 10)
-    return a, nil
+	db.First(&a, ID)
+	return a, nil
 }
 
 func LoadArticles(db *gorm.DB, includeRead bool, maxArticles int) ([]Article, error) {
 	var articles []Article
 
 	if includeRead {
-        db.Limit(maxArticles).Find(&articles)
+		db.Limit(maxArticles).Find(&articles)
 	} else {
-        db.Where(&Article{Read:false}).Limit(maxArticles).Find(&articles)
+		db.Where(&Article{Read: false}).Limit(maxArticles).Find(&articles)
 	}
 	return articles, nil
 }
@@ -58,13 +58,13 @@ func LoadArticles(db *gorm.DB, includeRead bool, maxArticles int) ([]Article, er
 // Load a feed
 func LoadFeeds(db *gorm.DB) ([]Feed, error) {
 	var feeds []Feed
-    db.Find(&feeds)
+	db.Find(&feeds)
 
 	return feeds, nil
 }
 
 func InitDB(filepath string) *gorm.DB {
-    db, err := gorm.Open(sqlite.Open(filepath), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(filepath), &gorm.Config{})
 
 	if err != nil {
 
@@ -74,7 +74,7 @@ func InitDB(filepath string) *gorm.DB {
 		log.Fatal("db nil")
 	}
 
-    db.AutoMigrate(&Article{}, &Feed{})
+	db.AutoMigrate(&Article{}, &Feed{})
 
 	return db
 }
@@ -108,7 +108,7 @@ func CheckNewArticles(db *gorm.DB, feed *Feed) ([]Article, error) {
 	fp := gofeed.NewParser()
 	rss, err := fp.ParseURL(feed.URL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("couldnt parse %v: %w", feed.URL, err)
 	}
 
 	var articles []Article
@@ -131,7 +131,7 @@ func CheckNewArticles(db *gorm.DB, feed *Feed) ([]Article, error) {
 		}
 	}
 	feed.LastCheckedTime = checkTime
-    db.Save(&feed) // TODO: wasteful to save everything
+	db.Save(&feed) // TODO: wasteful to save everything
 	return articles, nil
 }
 
@@ -151,7 +151,7 @@ func CreateFeeds(path string, db *gorm.DB) error {
 			LastCheckedTime: time.Time{}, // initialize to zero value
 		}
 
-        db.Create(&feed)
+		db.Create(&feed)
 	}
 	return nil
 }
@@ -161,7 +161,7 @@ var (
 )
 
 func indexArticles(db *gorm.DB, index bleve.Index) error {
-	articles, err := LoadArticles(db, true, 500)
+	articles, err := LoadArticles(db, true, 5000)
 	if err != nil {
 		return fmt.Errorf("db loading error: %v", err)
 	}
@@ -193,7 +193,6 @@ func printArticles(db *gorm.DB, printRead bool) error {
 }
 
 func updateFeeds(db *gorm.DB, index bleve.Index) error {
-	newCount := 0
 	feeds, err := LoadFeeds(db)
 	if err != nil {
 		return fmt.Errorf("Error loading feeds from db: %v", err)
@@ -201,28 +200,43 @@ func updateFeeds(db *gorm.DB, index bleve.Index) error {
 
 	log.Printf("Updating %d feeds", len(feeds))
 
-	for i, feed := range feeds {
-		// Check for new articles and return a list of articles plus update the db
-		newArticles, err := CheckNewArticles(db, &feed)
-		if err != nil {
-			log.Printf("Error checking new articles: %v", err)
-			continue
-		}
-
-		if len(newArticles) > 0 {
-			log.Printf("Retrieved %d articles from %v", len(newArticles), feed.URL)
-			log.Printf("feed %d: %v\n", i, feed)
-
-			// Iterate over the articles and print them
-			for _, article := range newArticles {
-                article.Feed = feed
-                db.Create(&article)
-				index.Index(string(article.ID), article)
-				newCount = newCount + 1
+	countsChan := make(chan int)
+	var wg sync.WaitGroup
+	for _, feed := range feeds {
+		wg.Add(1)
+		go func(feed Feed) {
+			defer wg.Done()
+			// Check for new articles and return a list of articles plus update the db
+			newArticles, err := CheckNewArticles(db, &feed)
+			if err != nil {
+				log.Printf("Error checking new articles: %v", err)
+				return
 			}
-		}
+
+			if len(newArticles) > 0 {
+				log.Printf("Retrieved %d articles from %v", len(newArticles), feed.URL)
+				//log.Printf("feed %d: %v\n", i, feed)
+
+				newCount := 0
+				// Iterate over the articles and print them
+				for _, article := range newArticles {
+					article.Feed = feed
+					db.Create(&article)
+					index.Index(string(article.ID), article)
+					newCount = newCount + 1
+				}
+				countsChan <- newCount
+			}
+		}(feed)
 	}
-	log.Printf("Fetched %d new articles", newCount)
+	wg.Wait()
+	log.Printf("All checks done")
+	close(countsChan)
+	totalCount := 0
+	for count := range countsChan {
+		totalCount += count
+	}
+	log.Printf("Fetched %d new articles", totalCount)
 	return nil
 }
 
@@ -273,7 +287,6 @@ func main() {
 					} else {
 						log.Printf("score=%.3v, %s, %s\n", hit.Score, article.Published, article.Title)
 					}
-
 				}
 			}
 		} else {
@@ -285,13 +298,13 @@ func main() {
 	case "update":
 		updateFeeds(db, index)
 	case "prune":
-        db.Where("id NOT IN (?)", db.Model(&Article{}).Select("FeedID").Where("FeedID IS NOT NULL")).Delete(&Feed{})
+		db.Where("id NOT IN (?)", db.Model(&Article{}).Select("feed_id").Where("feed_id IS NOT NULL")).Delete(&Feed{})
 	case "unread":
 		err := printArticles(db, false)
 		if err != nil {
 			log.Fatalf("Error reading unread article: %v", err)
 		}
-        db.Model(&Article{}).Update("Read", 1)
+		db.Model(&Article{}).Update("Read", 1)
 		if err != nil {
 			log.Fatalf("Error setting unread flag: %v", err)
 		}
