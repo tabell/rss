@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -106,7 +109,11 @@ func CheckNewArticles(db *gorm.DB, feed *Feed) ([]Article, error) {
 	//log.Printf("Last check time: %v", feed.LastCheckedTime)
 	checkTime := time.Now()
 	fp := gofeed.NewParser()
-	rss, err := fp.ParseURL(feed.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rss, err := fp.ParseURLWithContext(feed.URL, ctx)
 	if err != nil {
 		return nil, fmt.Errorf("couldnt parse %v: %w", feed.URL, err)
 	}
@@ -156,16 +163,18 @@ func CreateFeeds(path string, db *gorm.DB) error {
 	return nil
 }
 
-var (
-	_verbose = flag.Bool("verbose", false, "print lots of extra info")
-)
+func VerboseLog(format string, v ...interface{}) {
+	if _verbose {
+		log.Printf(format, v...)
+	}
+}
 
 func indexArticles(db *gorm.DB, index bleve.Index) error {
 	articles, err := LoadArticles(db, true, 5000)
 	if err != nil {
 		return fmt.Errorf("db loading error: %v", err)
 	}
-	log.Printf("Loaded %d articles from db", len(articles))
+	log.Printf("Indexing %d articles from db...", len(articles))
 
 	for _, a := range articles {
 		index.Index(fmt.Sprintf("%d", a.ID), a) // TODO: is there no way to make the key an int?
@@ -200,11 +209,11 @@ func updateFeeds(db *gorm.DB, index bleve.Index) error {
 
 	log.Printf("Updating %d feeds", len(feeds))
 
-	countsChan := make(chan int)
 	var wg sync.WaitGroup
 	for _, feed := range feeds {
 		wg.Add(1)
 		go func(feed Feed) {
+			newCount := 0
 			defer wg.Done()
 			// Check for new articles and return a list of articles plus update the db
 			newArticles, err := CheckNewArticles(db, &feed)
@@ -217,32 +226,90 @@ func updateFeeds(db *gorm.DB, index bleve.Index) error {
 				log.Printf("Retrieved %d articles from %v", len(newArticles), feed.URL)
 				//log.Printf("feed %d: %v\n", i, feed)
 
-				newCount := 0
 				// Iterate over the articles and print them
 				for _, article := range newArticles {
 					article.Feed = feed
 					db.Create(&article)
-					index.Index(string(article.ID), article)
+					index.Index(fmt.Sprint(article.ID), article)
 					newCount = newCount + 1
 				}
-				countsChan <- newCount
 			}
 		}(feed)
 	}
 	wg.Wait()
 	log.Printf("All checks done")
-	close(countsChan)
-	totalCount := 0
-	for count := range countsChan {
-		totalCount += count
-	}
-	log.Printf("Fetched %d new articles", totalCount)
 	return nil
 }
+
+func searchArticles(db *gorm.DB, index bleve.Index, args []string) error {
+	weightScore := func(score, age float64) float64 {
+		la := -math.Log(age)
+		recip := 1 / la
+		ws := score + recip
+		VerboseLog("index score=%.3v, age=%.6v, log(age)=%.5v, f*1/log(age)=%.6v, wscore=%.3v\n", score, age, la, recip, ws)
+		return ws
+	}
+	if len(args) > 0 {
+		query := bleve.NewQueryStringQuery(args[0])
+		searchRequest := bleve.NewSearchRequest(query) // Eventually pass our scoring into bleve? does it have access to date?
+		searchResults, _ := index.Search(searchRequest)
+		var sortedResults byWeightedScore
+		for _, hit := range searchResults.Hits {
+			id, err := strconv.Atoi(hit.ID)
+			if err == nil {
+				article, err := LoadArticle(db, id)
+				if err != nil {
+					return fmt.Errorf("error converting search result %v: %w", id, err)
+				} else {
+					age := time.Since(article.Published).Hours() / 24
+					s := scoredArticle{article: article, score: hit.Score, weightedScore: weightScore(hit.Score, age), age: age}
+					sortedResults = append(sortedResults, s)
+
+					VerboseLog("score=%.3v, %s, %s\n", hit.Score, article.Published, article.Title)
+					VerboseLog("---")
+				}
+			}
+		}
+		sort.Sort(byWeightedScore(sortedResults))
+		log.Printf("--- Sorted ---")
+		for _, sa := range sortedResults {
+			//ws := weightScore(sa.score, sa.age)
+			//text, err := html2text.FromString(sa.article.Description, html2text.Options{PrettyTables: true})
+			//if err != nil {
+			//	continue
+			//}
+			log.Printf("score=%.3v, date=%v, title=%s\n", sa.weightedScore, sa.article.Published, sa.article.Title)
+			//log.Printf("\t%s", text)
+		}
+	} else {
+		log.Fatalf("Usage: search <search string>")
+	}
+
+	return nil
+}
+
+type scoredArticle struct {
+	article       *Article
+	age           float64
+	score         float64
+	weightedScore float64
+}
+
+type byWeightedScore []scoredArticle
+
+func (a byWeightedScore) Len() int           { return len(a) }
+func (a byWeightedScore) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a byWeightedScore) Less(i, j int) bool { return a[i].weightedScore > a[j].weightedScore }
+
+var _verbose bool
 
 func main() {
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	// Set up global flags
+	flag.BoolVar(&_verbose, "verbose", false, "print lots of extra info")
+	flag.BoolVar(&_verbose, "v", false, "print lots of extra info")
 
 	// Parse global flags
 	flag.Parse()
@@ -267,36 +334,21 @@ func main() {
 	// Parse subcommand
 	args := flag.Args()
 	if len(args) == 0 {
-		log.Fatal("Please specify a subcommand.")
+		log.Fatal("Please specify a subcommand: search, index, fetch, refresh, prune, unread, import")
 	}
 	cmd, args := args[0], args[1:]
 
 	switch cmd {
 	case "search":
-		if len(args) > 0 {
-			query := bleve.NewQueryStringQuery(args[0])
-			searchRequest := bleve.NewSearchRequest(query)
-			searchResults, _ := index.Search(searchRequest)
-			for _, hit := range searchResults.Hits {
-				id, err := strconv.Atoi(hit.ID)
-				if err == nil {
-					article, err := LoadArticle(db, id)
-					if err != nil {
-						log.Printf("error converting search result %s: %w", id, err)
-						break
-					} else {
-						log.Printf("score=%.3v, %s, %s\n", hit.Score, article.Published, article.Title)
-					}
-				}
-			}
-		} else {
-			log.Fatalf("Usage: search <search string>")
-		}
+		searchArticles(db, index, args)
 
 	case "index":
 		indexArticles(db, index)
-	case "update":
+	case "fetch":
 		updateFeeds(db, index)
+	case "refresh":
+		updateFeeds(db, index)
+		indexArticles(db, index)
 	case "prune":
 		db.Where("id NOT IN (?)", db.Model(&Article{}).Select("feed_id").Where("feed_id IS NOT NULL")).Delete(&Feed{})
 	case "unread":
